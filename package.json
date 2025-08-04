@@ -1,0 +1,17 @@
+{
+  "name": "jiramcp",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "@types/node": "^24.1.0",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1"
+  }
+}
