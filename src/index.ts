@@ -5,6 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { JiraClient } from './JiraClient.js';
 import { loadConfig, validateConfig } from './config.js';
+import { WorkflowManager } from './WorkflowManager.js';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -27,6 +28,7 @@ const server = new Server({
 });
 
 const jiraClient = new JiraClient(config);
+const workflowManager = new WorkflowManager();
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
@@ -257,6 +259,61 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ['projectKey'],
         },
       },
+      {
+        name: 'get_workflow_step',
+        description: 'Get the current step of an active workflow',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            workflowId: {
+              type: 'string',
+              description: 'The ID of the workflow to check',
+            },
+          },
+          required: ['workflowId'],
+        },
+      },
+      {
+        name: 'respond_to_workflow',
+        description: 'Respond to the current step of an active workflow',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            workflowId: {
+              type: 'string',
+              description: 'The ID of the workflow to respond to',
+            },
+            response: {
+              type: 'string',
+              description: 'The response to the current workflow step',
+            },
+          },
+          required: ['workflowId', 'response'],
+        },
+      },
+      {
+        name: 'get_active_workflows',
+        description: 'Get all currently active workflows',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        name: 'cancel_workflow',
+        description: 'Cancel an active workflow',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            workflowId: {
+              type: 'string',
+              description: 'The ID of the workflow to cancel',
+            },
+          },
+          required: ['workflowId'],
+        },
+      },
     ],
   };
 });
@@ -330,6 +387,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'get_issue': {
         const issue = await jiraClient.getIssue(args?.issueKey as string);
+        
+        // Check if there's a workflow that should be triggered
+        const workflow = workflowManager.triggerWorkflow('get_issue', { issue });
+        
+        let workflowMessage = '';
+        if (workflow) {
+          const workflowState = workflowManager.startWorkflow(workflow.id, { issue });
+          const currentStep = workflowManager.getCurrentStep(workflow.id);
+          
+          if (currentStep) {
+            workflowMessage = `\n\n---\n**Workflow Triggered: ${workflow.name}**\n\n${currentStep.message}`;
+            if (currentStep.options) {
+              workflowMessage += `\n\nOptions: ${currentStep.options.join(', ')}`;
+            }
+            workflowMessage += `\n\nUse the 'respond_to_workflow' tool with workflowId '${workflow.id}' to continue.`;
+          }
+        }
+        
         return {
           content: [
             {
@@ -344,7 +419,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `Created: ${new Date(issue.fields.created).toLocaleDateString()}\n` +
                 `Updated: ${new Date(issue.fields.updated).toLocaleDateString()}\n` +
                 `Description: ${issue.fields.description || 'No description'}\n` +
-                `Resolution: ${issue.fields.resolution?.name || 'Unresolved'}`,
+                `Resolution: ${issue.fields.resolution?.name || 'Unresolved'}` +
+                workflowMessage,
             },
           ],
         };
@@ -533,6 +609,128 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'get_workflow_step': {
+        const workflowId = args?.workflowId as string;
+        const currentStep = workflowManager.getCurrentStep(workflowId);
+        
+        if (!currentStep) {
+          throw new McpError(ErrorCode.InvalidRequest, `No active workflow found with ID: ${workflowId}`);
+        }
+        
+        let stepInfo = `**Current Step:** ${currentStep.id}\n\n**Message:** ${currentStep.message}`;
+        if (currentStep.options) {
+          stepInfo += `\n\n**Options:** ${currentStep.options.join(', ')}`;
+        }
+        if (currentStep.required) {
+          stepInfo += `\n\n**Required:** Yes`;
+        }
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: stepInfo,
+            },
+          ],
+        };
+      }
+
+      case 'respond_to_workflow': {
+        const workflowId = args?.workflowId as string;
+        const response = args?.response as string;
+        
+        try {
+          const result = await workflowManager.processWorkflowResponse(workflowId, response);
+          
+          if (result.completed) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `**Workflow Completed Successfully!**\n\n${result.result?.message || 'Workflow has been completed.'}`,
+                },
+              ],
+            };
+          } else if (result.nextStep) {
+            let nextStepInfo = `**Next Step:** ${result.nextStep.id}\n\n**Message:** ${result.nextStep.message}`;
+            if (result.nextStep.options) {
+              nextStepInfo += `\n\n**Options:** ${result.nextStep.options.join(', ')}`;
+            }
+            if (result.nextStep.required) {
+              nextStepInfo += `\n\n**Required:** Yes`;
+            }
+            
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: nextStepInfo,
+                },
+              ],
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'Workflow step processed successfully.',
+                },
+              ],
+            };
+          }
+        } catch (error) {
+          throw new McpError(ErrorCode.InternalError, `Workflow error: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      case 'get_active_workflows': {
+        const activeWorkflows = workflowManager.getActiveWorkflows();
+        
+        if (activeWorkflows.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'No active workflows found.',
+              },
+            ],
+          };
+        }
+        
+        const workflowsList = activeWorkflows.map(workflow => 
+          `**Workflow ID:** ${workflow.workflowId}\n` +
+          `**Current Step:** ${workflow.currentStep}\n` +
+          `**Status:** ${workflow.completed ? 'Completed' : 'Active'}`
+        ).join('\n\n---\n\n');
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `**Active Workflows:**\n\n${workflowsList}`,
+            },
+          ],
+        };
+      }
+
+      case 'cancel_workflow': {
+        const workflowId = args?.workflowId as string;
+        const cancelled = workflowManager.cancelWorkflow(workflowId);
+        
+        if (cancelled) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Workflow ${workflowId} has been cancelled successfully.`,
+              },
+            ],
+          };
+        } else {
+          throw new McpError(ErrorCode.InvalidRequest, `No active workflow found with ID: ${workflowId}`);
+        }
       }
 
       default:
